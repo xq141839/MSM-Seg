@@ -16,9 +16,9 @@ from sam2_train.modeling.sam.prompt_encoder import PromptEncoder
 from sam2_train.modeling.sam.transformer import TwoWayTransformer
 from sam2_train.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 from sam2_train.modeling.memory_attention import MemoryAttention, MemoryAttentionLayer
-from sam2_train.modeling.sam2_self_prompt import PyramidPromptUNet
+from sam2_train.modeling.sam2_self_prompt import PyramidPromptUNet, ModalityAdaptiveFusion
 from sam2_train.modeling.split_attention import SplitAttention
-# a large negative value as a placeholder score for missing objects
+# a large negative value as  a placeholder score for missing objects
 NO_OBJ_SCORE = -4.0
 
 
@@ -203,6 +203,8 @@ class SAM2Base(torch.nn.Module):
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
         self.num_modality = num_modality
         self.self_prompt = PyramidPromptUNet()
+        # [新增] 论文 Eq.9 模态自适应融合：把每个切片的 M 个模态预测融合成最终 Ŷ_t
+        self.modality_fusion = ModalityAdaptiveFusion(num_modality=num_modality)
         # Model compilation
         if compile_image_encoder:
             # Compile the forward function (not the full module) to allow loading checkpoints.
@@ -254,6 +256,7 @@ class SAM2Base(torch.nn.Module):
         )
         self.sam_mask_decoder = MaskDecoder(
             num_multimask_outputs=4,
+            num_seg_classes=3,  # category-agnostic 多类别输出：WT/TC/ET（与数据集 3 类 GT 对应）
             transformer=TwoWayTransformer(
                 depth=2,
                 embedding_dim=self.sam_prompt_embed_dim,
@@ -344,7 +347,6 @@ class SAM2Base(torch.nn.Module):
         assert backbone_features.size(3) == self.sam_image_embedding_size
 
         # a) Handle point prompts
-
         if point_inputs is not None:
             sam_point_coords = point_inputs["point_coords"]
             sam_point_labels = point_inputs["point_labels"]
@@ -399,30 +401,18 @@ class SAM2Base(torch.nn.Module):
         # convert masks from possibly bfloat16 (or float16) to float32
         # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
         low_res_multimasks = low_res_multimasks.float()
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        # high_res_multimasks = F.interpolate(
+        #     low_res_multimasks,
+        #     size=(self.image_size, self.image_size),
+        #     mode="bilinear",
+        #     align_corners=False,
+        # )
+        high_res_multimasks = low_res_multimasks
 
-        
-        modal_index = frame_idx % 4
-        if modal_index==3:
-            t2 = high_res_multimasks
-            t1c = inference_state['modality_mask'][frame_idx-1]
-            t1 = inference_state['modality_mask'][frame_idx-2]
-            flair = inference_state['modality_mask'][frame_idx-3]
-
-            modal_weights = self.weight_gen(backbone_features)  
-            flair_weight = modal_weights[:, 0:1, :, :].squeeze(0).squeeze(0).squeeze(0).squeeze(0)
-            t1_weight = modal_weights[:, 1:2, :, :].squeeze(0).squeeze(0).squeeze(0).squeeze(0)
-            t1c_weight = modal_weights[:, 2:3, :, :].squeeze(0).squeeze(0).squeeze(0).squeeze(0)
-            t2_weight = modal_weights[:, 3:4, :, :].squeeze(0).squeeze(0).squeeze(0).squeeze(0)
-
-            high_res_multimasks = t2 * t2_weight + t1c * t1c_weight + t1 * t1_weight + flair * flair_weight
-            # high_res_multimasks = t2 + t1c + t1 + flair
-
+        # [修改] 移除原 modal_index==3 处的 weight_gen 模态融合：
+        #   该融合（把 4 个模态掩码加权和、第 4 模态输出即融合结果）现在统一改到
+        #   视频预测器里按“每个类别”做自适应融合(Eq.9)，避免重复融合。
+        #   这里 decoder 已输出 [B, num_seg_classes, h, w] 三个区域(WT/TC/ET)的逐模态预测 Ŷ_{t,m}。
         low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
         return (low_res_masks, high_res_masks)
 
@@ -467,145 +457,86 @@ class SAM2Base(torch.nn.Module):
         feat_sizes,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
+        track_in_reverse=False,
     ):
         """Fuse the current frame's visual feature map with previous memory."""
-        B = current_vision_feats[-1].size(1)  # batch size on this frame
+        B = current_vision_feats[-1].size(1)  
         C = self.hidden_dim
-        H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
-        # The case of `self.num_maskmem == 0` below is primarily used for reproducing SAM on images.
-        # In this case, we skip the fusion with any memory.
-        if self.num_maskmem == 0:  # Disable memory and skip fusion
+        H, W = feat_sizes[-1]  
+        
+        if self.num_maskmem == 0: 
             pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
             return pix_feat
+            
         num_obj_ptr_tokens = 0
-        # Step 1: condition the visual features of the current frame on previous memories
-        # print(not is_init_cond_frame)
-        # print(frame_idx)
+        to_cat_memory, to_cat_memory_pos_embed = [], []
+
         if not is_init_cond_frame:
-            # Retrieve the memories encoded with the maskmem backbone
-            to_cat_memory, to_cat_memory_pos_embed = [], []
-            # Add conditioning frames's output first (all cond frames have t_pos=0 for
-            # when getting temporal positional embedding below)
-            assert len(output_dict["cond_frame_outputs"]) > 0
-            # Select a maximum number of temporally closest cond frames for cross attention
-            cond_outputs = output_dict["cond_frame_outputs"]
-            selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
-                frame_idx, cond_outputs, self.max_cond_frames_in_attn
-            )
-            t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
-            # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
-            # the earliest one has t_pos=1 and the latest one has t_pos=self.num_maskmem-1
-            # We also allow taking the memory frame non-consecutively (with r>1), in which case
-            # we take (self.num_maskmem - 2) frames among every r-th frames plus the last frame.
-            r = self.memory_temporal_stride_for_eval
-            for t_pos in range(1, self.num_maskmem):
-                t_rel = self.num_maskmem - t_pos  # how many frames before current frame
-                if t_rel == 1:
-                    # for t_rel == 1, we take the last frame (regardless of r)
-                    if not track_in_reverse:
-                        # the frame immediately before this frame (i.e. frame_idx - 1)
-                        prev_frame_idx = frame_idx - t_rel
-                    else:
-                        # the frame immediately after this frame (i.e. frame_idx + 1)
-                        prev_frame_idx = frame_idx + t_rel
-                else:
-                    # for t_rel >= 2, we take the memory frame from every r-th frames
-                    if not track_in_reverse:
-                        # first find the nearest frame among every r-th frames before this frame
-                        # for r=1, this would be (frame_idx - 2)
-                        prev_frame_idx = ((frame_idx - 2) // r) * r
-                        # then seek further among every r-th frames
-                        prev_frame_idx = prev_frame_idx - (t_rel - 2) * r
-                    else:
-                        # first find the nearest frame among every r-th frames after this frame
-                        # for r=1, this would be (frame_idx + 2)
-                        prev_frame_idx = -(-(frame_idx + 2) // r) * r
-                        # then seek further among every r-th frames
-                        prev_frame_idx = prev_frame_idx + (t_rel - 2) * r
-                out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-                if out is None:
-                    # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
-                    # frames, we still attend to it as if it's a non-conditioning frame.
-                    out = unselected_cond_outputs.get(prev_frame_idx, None)
-                t_pos_and_prevs.append((t_pos, out))
-
-            for t_pos, prev in t_pos_and_prevs:
-                if prev is None:
-                    continue  # skip padding frames
-                # "maskmem_features" might have been offloaded to CPU in demo use cases,
-                # so we load it back to GPU (it's a no-op if it's already on GPU).
-                feats = prev["maskmem_features"]
-                #print(feats.shape)
-                to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))#[[4096, 1, 64]]
-                #print(to_cat_memory[-1].shape)
-                # Spatial positional encoding (it might have been offloaded to CPU in eval)
-                maskmem_enc = prev["maskmem_pos_enc"][-1]
-                maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
-                # Temporal positional encoding
-                # print(maskmem_enc.shape, self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1].shape)
-                maskmem_enc = (
-                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
+            # ==========================================================
+            # [修改点 2.1]：移除了强行要求 cond_frame_outputs > 0 的限制
+            # 只有当用户确实提供了 prompt 时，我们才提取 Cond Frames
+            # ==========================================================
+            cond_outputs = output_dict.get("cond_frame_outputs", {})
+            unselected_cond_outputs = {}
+            if len(cond_outputs) > 0:
+                selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
+                    frame_idx, cond_outputs, self.max_cond_frames_in_attn
                 )
-                to_cat_memory_pos_embed.append(maskmem_enc)
+                for t, out in selected_cond_outputs.items():
+                    feats = out["maskmem_features"]
+                    to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
+                    maskmem_enc = out["maskmem_pos_enc"][-1].flatten(2).permute(2, 0, 1)
+                    # Cond frames t_pos = 0
+                    maskmem_enc = maskmem_enc + self.maskmem_tpos_enc[-1]
+                    to_cat_memory_pos_embed.append(maskmem_enc)
 
-            # Construct the list of past object pointers
-            if self.use_obj_ptrs_in_encoder:
-                max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
-                # First add those object pointers from selected conditioning frames
-                # (optionally, only include object pointers in the past during evaluation)
-                if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
-                    ptr_cond_outputs = {
-                        t: out
-                        for t, out in selected_cond_outputs.items()
-                        if (t >= frame_idx if track_in_reverse else t <= frame_idx)
-                    }
-                else:
-                    ptr_cond_outputs = selected_cond_outputs
-                pos_and_ptrs = [
-                    # Temporal pos encoding contains how far away each pointer is from current frame
-                    (abs(frame_idx - t), out["obj_ptr"])
-                    for t, out in ptr_cond_outputs.items()
-                ]
-                # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
-                for t_diff in range(1, max_obj_ptrs_in_encoder):
-                    t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
-                    if t < 0 or (num_frames is not None and t >= num_frames):
-                        break
-                    out = output_dict["non_cond_frame_outputs"].get(
-                        t, unselected_cond_outputs.get(t, None)
-                    )
+            # ==========================================================
+            # [修改点 2.2]：Slice 级别的 Temporal Memory 跨越式提取
+            # 跳过零碎的模态，直接提取过去 (num_maskmem - 1) 个 Slice 融合后的最终帧
+            # ==========================================================
+            current_slice_idx = frame_idx // self.num_modality
+            
+            for t_pos in range(1, self.num_maskmem):
+                t_rel = self.num_maskmem - t_pos 
+                prev_slice_idx = current_slice_idx - t_rel
+                
+                if prev_slice_idx >= 0:
+                    # 过去 Slice 的融合结果保存在最后一个模态 (例如 idx = 3, 7, 11...)
+                    prev_fused_frame_idx = prev_slice_idx * self.num_modality + (self.num_modality - 1)
+                    
+                    out = output_dict["non_cond_frame_outputs"].get(prev_fused_frame_idx, None)
+                    if out is None:
+                        out = unselected_cond_outputs.get(prev_fused_frame_idx, None)
+                        
                     if out is not None:
-                        pos_and_ptrs.append((t_diff, out["obj_ptr"]))
-                # If we have at least one object pointer, add them to the across attention
+                        feats = out["maskmem_features"]
+                        to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
+                        maskmem_enc = out["maskmem_pos_enc"][-1].flatten(2).permute(2, 0, 1)
+                        # Temporal positional encoding
+                        maskmem_enc = maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
+                        to_cat_memory_pos_embed.append(maskmem_enc)
 
-                num_obj_ptr_tokens = 0
+            # 如果即没有 Cond Frames，也没有过去的 Slice（例如刚走到第 1、2、3 帧）
+            if len(to_cat_memory) == 0:
+                HW = current_vision_pos_embeds[-1].shape[0]
+                to_cat_memory = [self.no_mem_embed[:, :, :self.mem_dim].expand(HW, B, self.mem_dim)]
+                to_cat_memory_pos_embed = [self.no_mem_pos_enc[:, :, :self.mem_dim].expand(HW, B, self.mem_dim)]
+
         else:
-            # for initial conditioning frames, encode them without using any previous memory
-            if self.directly_add_no_mem_embed:
-                # directly add no-mem embedding (instead of using the transformer encoder)
-                pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
-                pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
-                return pix_feat_with_mem
+            # is_init_cond_frame == True，完全没有历史
+            HW = current_vision_pos_embeds[-1].shape[0]
+            to_cat_memory = [self.no_mem_embed[:, :, :self.mem_dim].expand(HW, B, self.mem_dim)]
+            to_cat_memory_pos_embed = [self.no_mem_pos_enc[:, :, :self.mem_dim].expand(HW, B, self.mem_dim)]
 
-            # Use a dummy token on the first frame (to avoid emtpy memory input to tranformer encoder)
-            to_cat_memory = [self.no_mem_embed.expand(1, B, self.mem_dim)]
-            to_cat_memory_pos_embed = [self.no_mem_pos_enc.expand(1, B, self.mem_dim)]
-
-        # Step 2: Concatenate the memories and forward through the transformer encoder
-        # print(to_cat_memory[0].shape, to_cat_memory[1].shape)
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
         
-        # 使用Split Attention增强特征多样性
-        current_feat_tensor = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)  # [B, C, H, W]
+        current_feat_tensor = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)  
         
-        # 构建模态间memory的参数
         modal_memory_kwargs = self._build_modal_memory_kwargs(
             frame_idx, is_init_cond_frame, output_dict, num_frames, B, current_vision_pos_embeds
         )
         
-        # 构建帧间memory的参数
         temporal_memory_kwargs = {
             'curr_pos': current_vision_pos_embeds,
             'memory': memory,
@@ -613,7 +544,6 @@ class SAM2Base(torch.nn.Module):
             'num_obj_ptr_tokens': num_obj_ptr_tokens,
         }
         
-        # 使用Split Attention处理特征
         enhanced_features = self.split_attention(
             current_feat_tensor,
             temporal_memory_module=self.memory_attention,
@@ -679,7 +609,10 @@ class SAM2Base(torch.nn.Module):
         # Step 2: 拼接memory和pos，送入modality memory attention
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
-
+        #curr = pix_feat_with_frame_mem.flatten(2).permute(2, 0, 1)
+        #curr_pos = current_vision_pos_embeds[-1].flatten(2).permute(2, 0, 1)
+        # print("current_vision_pos_embeds in modality memory attention")
+        # print(current_vision_pos_embeds[-1].shape)
         pix_feat_with_modality_mem = self.modality_memory_attention(
             curr=[pix_feat_with_frame_mem],
             curr_pos=current_vision_pos_embeds,
@@ -687,7 +620,9 @@ class SAM2Base(torch.nn.Module):
             memory_pos=memory_pos_embed,
             num_obj_ptr_tokens=0,
         )
-
+        # print(frame_idx)
+        # print("输出最小值:", pix_feat_with_modality_mem.min().item())
+        # print("输出最大值:", pix_feat_with_modality_mem.max().item())
         return pix_feat_with_modality_mem
         
     def _encode_new_memory(
@@ -772,24 +707,32 @@ class SAM2Base(torch.nn.Module):
             track_in_reverse=track_in_reverse,
         )
 
+        # 从 point_inputs 取出 box / 点提示（仅用于引导 MCP-Encoder，不影响记忆/条件帧逻辑）
+        if isinstance(point_inputs, dict):
+            box_prompt = point_inputs.get("box", None)
+            pt_coords = point_inputs.get("point_coords", None)
+            pt_labels = point_inputs.get("point_labels", None)
+        else:
+            box_prompt = pt_coords = pt_labels = None
+        use_prompts_flag = (box_prompt is not None) or (pt_coords is not None)
+
         self_prompt = self.self_prompt(
             high_res_features = high_res_features,
             pix_feat_with_mem = pix_feat_with_mem,
             past_mask = None,
-            point_coords = point_inputs["point_coords"] if point_inputs is not None else None,
-            point_labels = point_inputs["point_labels"] if point_inputs is not None else None,
+            point_coords = pt_coords,
+            point_labels = pt_labels,
             scribbles = None,
-            box = None,
-            use_prompts = False,
-            input_resolution = self.image_size  # 传递图像尺寸作为坐标系分辨率
+            box = box_prompt,
+            use_prompts = use_prompts_flag,
+            input_resolution = 256  # box/点坐标统一在 256 坐标系（与 guidance/GT 同尺度）
         )
 
-        # print(point_inputs)
         sam_outputs = self._forward_sam_heads(
             frame_idx=frame_idx,
             inference_state=inference_state,
             backbone_features=pix_feat_with_mem,
-            point_inputs=point_inputs,
+            point_inputs=None,
             mask_inputs=torch.sigmoid(self_prompt),
             high_res_features=high_res_features,
             multimask_output=True,
@@ -800,8 +743,6 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
         ) = sam_outputs
 
-        # print(sam_outputs)
-
         # print(high_res_masks.shape)
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
@@ -809,7 +750,9 @@ class SAM2Base(torch.nn.Module):
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
         if run_mem_encoder and self.num_maskmem > 0:
-            high_res_masks_for_mem_enc = high_res_masks
+            # [修改] 多类别输出后，记忆编码器仍只吃 1 个通道：取 WT(整肿瘤, 通道0)。
+            # WT 覆盖范围最大、最适合做跨切片/跨模态的空间记忆，TC/ET 是其子集。
+            high_res_masks_for_mem_enc = high_res_masks[:, 0:1]
             maskmem_features, maskmem_pos_enc = self._encode_new_memory(
                 current_vision_feats=current_vision_feats,
                 feat_sizes=feat_sizes,
@@ -858,25 +801,24 @@ class SAM2Base(torch.nn.Module):
     def _build_modal_memory_kwargs(self, frame_idx, is_init_cond_frame, output_dict, num_frames, B, curr_pos):
 
         """构建模态间Memory Attention的参数 - 完全匹配_prepare_modality_memory_features的逻辑"""
-        # print(is_init_cond_frame)
-        # print(f"🔍 [模态Memory] 帧{frame_idx}: 构建模态间memory参数")
+        # [修复 Bug]: 这里动态提取了真实空间的 HW (比如 4096)，确保 RoPE 可以正常识别到 2D 网格结构
+        HW = curr_pos[-1].shape[0]
+        
         if self.num_modality == 1 or is_init_cond_frame:
-            # print(f"  → 单模态或初始条件帧，使用空memory")
-            # print(self.no_mem_embed.shape, self.mem_dim)
             return {
                 'curr_pos': curr_pos,
-                'memory': self.no_mem_embed.expand(1, B, self.mem_dim),
-                'memory_pos': self.no_mem_pos_enc.expand(1, B, self.mem_dim),
+                'memory': self.no_mem_embed[:, :, :self.mem_dim].expand(HW, B, self.mem_dim),
+                'memory_pos': self.no_mem_pos_enc[:, :, :self.mem_dim].expand(HW, B, self.mem_dim),
                 'num_obj_ptr_tokens': 0,
             }
         
-        current_modality = frame_idx #% self.num_modality
+        # [修复 Bug]: 这里恢复了被注释掉的取模运算 %
+        # 否则 current_modality 会等于当前全局帧数，导致往前查找的帧数超出了模态窗口，引发越界错误！
+        current_modality = frame_idx % self.num_modality
+        
         to_cat_memory = []
         to_cat_memory_pos_embed = []
         found_frames = []
-        
-        # print(f"  → 当前模态: {current_modality}")
-        # print(f"  → 逻辑帧布局: 每{self.num_modality}帧为一组，当前帧{frame_idx}在组内位置{current_modality}")
         
         # 完全按照_prepare_modality_memory_features的逻辑
         for i in range(1, current_modality + 1):  # 1, 2, ..., current_modality
@@ -892,18 +834,14 @@ class SAM2Base(torch.nn.Module):
             if idx in output_dict.get("cond_frame_outputs", {}):
                 out = output_dict["cond_frame_outputs"][idx]
                 tpos = 0
-                # print(f"    找到条件帧 {idx} (模态{target_modality}) -> tpos=0")
             elif idx in output_dict.get("non_cond_frame_outputs", {}):
                 out = output_dict["non_cond_frame_outputs"][idx]
                 tpos = i  # 非条件帧，tpos为i，也就是说越近的帧tpos越小
-                # print(f"    找到非条件帧 {idx} (模态{target_modality}) -> tpos={tpos}")
                 
             if out is None:
-                # print(f"    跳过帧 {idx} (模态{target_modality}) - 无输出")
                 continue
                 
             if "maskmem_features" not in out:
-                # print(f"    跳过帧 {idx} (模态{target_modality}) - 无maskmem_features")
                 continue
                 
             # 获取该帧的memory特征
@@ -923,26 +861,17 @@ class SAM2Base(torch.nn.Module):
             to_cat_memory_pos_embed.append(maskmem_enc)
             found_frames.append((idx, target_modality, tpos))
         
-        # print(f"  → 找到的模态帧: {found_frames}")
-        # print(f"    这些帧来自同一个物理时间点的不同模态 ✅")
-        # print(current_modality)
-        # print(self.no_mem_embed.shape)
-        # print(self.mem_dim)
-        # print((1, B, self.mem_dim))
         if len(to_cat_memory) == 0:
-            # print(f"  → 未找到模态memory，使用空memory")
             return {
                 'curr_pos': curr_pos,
-                'memory': self.no_mem_embed.expand(1, B, self.mem_dim),
-                'memory_pos': self.no_mem_pos_enc.expand(1, B, self.mem_dim),
+                'memory': self.no_mem_embed[:, :, :self.mem_dim].expand(HW, B, self.mem_dim),
+                'memory_pos': self.no_mem_pos_enc[:, :, :self.mem_dim].expand(HW, B, self.mem_dim),
                 'num_obj_ptr_tokens': 0,
             }
         
         # 拼接所有模态memory
         modal_memory = torch.cat(to_cat_memory, dim=0)
         modal_memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
-        
-        # print(f"  → 模态memory形状: {modal_memory.shape}, pos编码形状: {modal_memory_pos_embed.shape}")
         
         return {
             'curr_pos': curr_pos,

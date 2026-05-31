@@ -35,7 +35,7 @@ def get_network(args, net, use_gpu=True, gpu_device = 0, distribution = True):
         sys.exit()
 
     if use_gpu:
-        net = net.to(device=gpu_device)
+        net = net.cuda()
 
     return net
 
@@ -250,3 +250,31 @@ class DiceCoeff(Function):
             grad_target = None
 
         return grad_input, grad_target
+
+
+def build_prompt_dict(box_tensor, device):
+    """把逐帧 box [N,4]（256 坐标系，全 0 表示该帧无框）转成 net.forward 需要的 prompt 字典。
+
+    返回 {frame_idx: {"box": [1,1,4], "point_coords": None, "point_labels": None}}，
+    只放入有效框的帧；无有效框时返回 None（→ 该 batch 走自动模式）。
+    box 仅用于引导 MCP-Encoder，不改变记忆/条件帧逻辑。
+    """
+    if box_tensor is None:
+        return None
+    if not torch.is_tensor(box_tensor):
+        box_tensor = torch.as_tensor(box_tensor)
+    if box_tensor.numel() == 0 or box_tensor.dim() != 2 or box_tensor.shape[1] != 4:
+        return None
+
+    prompt = {}
+    n = box_tensor.shape[0]
+    for i in range(n):
+        b = box_tensor[i]
+        # 有效框：x2>x1 且 y2>y1
+        if float(b[2]) > float(b[0]) and float(b[3]) > float(b[1]):
+            prompt[i] = {
+                "box": b.view(1, 1, 4).to(device).float(),
+                "point_coords": None,
+                "point_labels": None,
+            }
+    return prompt if len(prompt) > 0 else None

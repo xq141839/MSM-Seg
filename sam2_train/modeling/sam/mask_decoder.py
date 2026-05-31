@@ -30,6 +30,7 @@ class MaskDecoder(nn.Module):
         pred_obj_scores: bool = False,
         pred_obj_scores_mlp: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
+        num_seg_classes: int = 3,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -55,6 +56,9 @@ class MaskDecoder(nn.Module):
 
         self.iou_token = nn.Embedding(1, transformer_dim)
         self.num_mask_tokens = num_multimask_outputs + 1
+        # [论文 Eq.8] 这 num_mask_tokens(=4) 个 token 被复用为“每个模态一个查询 token”，
+        # 即 E_{t,m}（m=0..3 对应 T1c/T1n/T2w/T2f）。配合下方 4 个 hypernetwork MLP，
+        # 实现“模态专属”的分割头。要求 num_multimask_outputs=3，使 num_mask_tokens 恰为 4=模态数。
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
 
         self.pred_obj_scores = pred_obj_scores
@@ -62,6 +66,8 @@ class MaskDecoder(nn.Module):
             self.obj_score_token = nn.Embedding(1, transformer_dim)
         self.use_multimask_token_for_obj_ptr = use_multimask_token_for_obj_ptr
 
+        # [论文 Eq.8] 共享像素解码器 P_pd(·)：对所有模态共用同一套上采样权重，
+        # 把 H_{t,m}=Z_{t,m}⊕P_{t,m}（src+dense_prompt）上采样为逐像素嵌入。
         self.output_upscaling = nn.Sequential(
             nn.ConvTranspose2d(
                 transformer_dim, transformer_dim // 4, kernel_size=2, stride=2
@@ -82,10 +88,27 @@ class MaskDecoder(nn.Module):
                 transformer_dim, transformer_dim // 4, kernel_size=1, stride=1
             )
 
+        # [论文 Eq.8] 模态专属 MLP P_mlp(·)：每个模态(每个 mask token)一套独立 MLP，
+        # 作用在该模态的 token 输出 E_{t,m} 上，再与共享像素嵌入做 ⊗ 得到 Ŷ_{t,m}。
+        # [论文 Eq.8] 模态专属 MLP P_mlp(·)：每个模态(每个 mask token)一套独立 MLP，
+        # 作用在该模态的 token 输出 E_{t,m} 上，再与共享像素嵌入做 ⊗ 得到 Ŷ_{t,m}。
+        # 注：改为多类别(WT/TC/ET)联合输出后，下方 class_hypernetworks 才是真正使用的输出头；
+        # 这组 output_hypernetworks_mlps 保留以兼容结构，但不再参与最终预测。
         self.output_hypernetworks_mlps = nn.ModuleList(
             [
                 MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
                 for i in range(self.num_mask_tokens)
+            ]
+        )
+
+        # [category-agnostic 多类别输出] num_seg_classes 个“类别专属 MLP”(WT/TC/ET)。
+        # 对当前模态 token E_{t,m} 各出一路，与共享像素解码器输出做 ⊗，
+        # 得到该模态对 3 个区域的二值预测。一个整肿瘤框 → 同时分割 WT/TC/ET。
+        self.num_seg_classes = num_seg_classes
+        self.class_hypernetworks = nn.ModuleList(
+            [
+                MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
+                for _ in range(num_seg_classes)
             ]
         )
 
@@ -124,6 +147,9 @@ class MaskDecoder(nn.Module):
           torch.Tensor: batched predictions of mask quality
           torch.Tensor: batched SAM token for mask output
         """
+        # [论文 Eq.8] 当前帧所属模态编号 m（帧按 切片优先、4 模态交错排列）。
+        # 用它在 predict_masks 里选出该模态的 query token E_{t,m}（保留模态专属性）。
+        modal_index = frame_idx % 4
         masks = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
@@ -131,11 +157,9 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             repeat_image=repeat_image,
             high_res_features=high_res_features,
+            modal_index=modal_index,
         )
-
-        modal_index = frame_idx % 4
-        masks=masks[:, modal_index:modal_index+1, :, :]
-        # Prepare output
+        # 输出该模态对 WT/TC/ET 三个区域的预测 Ŷ_{t,m} ∈ [B, num_seg_classes, h, w]
         return masks
 
     def predict_masks(
@@ -146,6 +170,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        modal_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -185,12 +210,14 @@ class MaskDecoder(nn.Module):
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
+        # [论文 Eq.8] 取当前模态的 query token 输出 E_{t,m}（模态专属），
+        # 再分别过 num_seg_classes 个“类别专属 MLP”，与共享像素嵌入做 ⊗，
+        # 得到该模态对 WT/TC/ET 三个区域的预测 Ŷ_{t,m} ∈ [b, num_seg_classes, h, w]。
+        E_m = mask_tokens_out[:, modal_index, :]  # [b, c]  当前模态的查询嵌入
         hyper_in_list: List[torch.Tensor] = []
-        for i in range(self.num_mask_tokens):
-            hyper_in_list.append(
-                self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
-            )
-        hyper_in = torch.stack(hyper_in_list, dim=1)
+        for c_idx in range(self.num_seg_classes):
+            hyper_in_list.append(self.class_hypernetworks[c_idx](E_m))
+        hyper_in = torch.stack(hyper_in_list, dim=1)  # [b, num_seg_classes, c//8]
         b, c, h, w = upscaled_embedding.shape
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
 

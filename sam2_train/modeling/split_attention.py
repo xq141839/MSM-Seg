@@ -106,7 +106,7 @@ def test_simple_split_attention():
     print("测试简单分离注意力 (Channel Split)")
     print("=" * 60)
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     print(f"使用设备: {device}")
     
     # 创建模型

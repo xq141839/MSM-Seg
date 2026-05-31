@@ -6,7 +6,6 @@
 
 from collections import OrderedDict
 
-from sympy import im
 import torch
 
 from tqdm import tqdm
@@ -21,12 +20,8 @@ class SAM2VideoPredictor(SAM2Base):
     def __init__(
         self,
         fill_hole_area=0,
-        # whether to apply non-overlapping constraints on the output object masks
         non_overlap_masks=False,
-        # whether to clear non-conditioning memory of the surrounding frames (which may contain outdated information) after adding correction clicks;
-        # note that this would only apply to *single-object tracking* unless `clear_non_cond_mem_for_multi_obj` is also set to True)
         clear_non_cond_mem_around_input=False,
-        # whether to also clear non-conditioning memory of the surrounding frames (only effective when `clear_non_cond_mem_around_input` is True).
         clear_non_cond_mem_for_multi_obj=False,
         **kwargs,
     ):
@@ -36,93 +31,99 @@ class SAM2VideoPredictor(SAM2Base):
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
 
-
-    # @torch.inference_mode()
     def forward(
         self,
         imgs_tensor,
         prompt,
-        normalize_coords=True,
     ):
-        
         video_height = self.image_size
         video_width = self.image_size
-        # images = load_video_frames_from_data(
-        #     imgs_tensor=imgs_tensor,
-        #     offload_video_to_cpu=False,
-        #     async_loading_frames=False,
-        # )
         images = imgs_tensor
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
-        # whether to offload the video frames to CPU memory
-        # turning on this option saves the GPU memory with only a very small overhead
+        # =====================================================================
+        # [显存优化] 官方特征转移 CPU (可根据需要开启，当前保持 False 避免速度损耗)
+        # =====================================================================
         inference_state["offload_video_to_cpu"] = False
 
         inference_state["video_height"] = video_height
         inference_state["video_width"] = video_width
-        inference_state["device"] = torch.device("cuda")
-        inference_state["storage_device"] = torch.device("cuda")
+        
+        inference_state["device"] = imgs_tensor.device
+        inference_state["storage_device"] = imgs_tensor.device
 
-        # A storage to hold the model's tracking results and states on each frame
         inference_state["output_dict"] = {
-            "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
-            "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            "cond_frame_outputs": {},  
+            "non_cond_frame_outputs": {},  
         }
         inference_state["constants"] = {}
-
-        inference_state["modality_memory"] = {}  # {frame_idx: <prompt>}
+        inference_state["modality_memory"] = {}  
         inference_state["slice_memory"] = {}
-        inference_state["self_prompt"] = {} # {frame_idx: <self_prompt>}
+        inference_state["self_prompt"] = {} 
         inference_state["modality_mask"] = {}
         
         bs = inference_state['num_frames']      
-
         output_dict = inference_state["output_dict"]
         outputs_mask = []
         outputs_mask_low = []
 
-        points = prompt.reshape(-1, 2, 2)
-        labels = torch.tensor([2, 3], dtype=torch.int)
-
-        if not isinstance(points, torch.Tensor):
-            points = torch.tensor(points, dtype=torch.float32)
-        if not isinstance(labels, torch.Tensor):
-            labels = torch.tensor(labels, dtype=torch.int32)
-        if points.dim() == 2:
-            points = points.unsqueeze(0)  # add batch dimension
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(0)  # add batch dimension
-        if normalize_coords:
-            video_H = inference_state["video_height"]
-            video_W = inference_state["video_width"]
-            points = points / torch.tensor([video_W, video_H]).to(points.device)
-        # scale the (normalized) coordinates by the model's internal image size
-        points = points * self.image_size
-        points = points.to(inference_state["device"])
-        labels = labels.to(inference_state["device"])
+        # =====================================================================
+        # 批量并行提取 ViT 图像特征
+        # =====================================================================
+        chunk_size = 16  
+        all_vision_feats = []
+        all_vision_pos_embeds = []
+        global_feat_sizes = None
+        
+        for start_idx in range(0, bs, chunk_size):
+            end_idx = min(start_idx + chunk_size, bs)
+            img_chunk = inference_state["images"][start_idx:end_idx]
+            
+            backbone_out = self.forward_image(img_chunk)
+            vision_feats, vision_pos_embeds, feat_sizes = self._prepare_backbone_features(backbone_out)
+            
+            if global_feat_sizes is None:
+                global_feat_sizes = feat_sizes
+                all_vision_feats = [[] for _ in range(len(vision_feats))]
+                all_vision_pos_embeds = [[] for _ in range(len(vision_pos_embeds))]
+                
+            for lvl in range(len(vision_feats)):
+                all_vision_feats[lvl].append(vision_feats[lvl])
+                all_vision_pos_embeds[lvl].append(vision_pos_embeds[lvl])
+                
+        all_vision_feats = [torch.cat(feats, dim=1) for feats in all_vision_feats]
+        all_vision_pos_embeds = [torch.cat(pos, dim=1) for pos in all_vision_pos_embeds]
 
         for frame_idx in range(bs):
-            backbone_out = self.forward_image(inference_state["images"][frame_idx].unsqueeze(0))
-            current_vision_feats, current_vision_pos_embeds, feat_sizes = self._prepare_backbone_features(backbone_out)
-            storage_key = "cond_frame_outputs"
+            current_vision_feats = [feat[:, frame_idx:frame_idx+1, :] for feat in all_vision_feats]
+            current_vision_pos_embeds = [pos[:, frame_idx:frame_idx+1, :] for pos in all_vision_pos_embeds]
 
-            # 检查points[frame_idx]是否有nan值
-            if torch.isnan(points[frame_idx]).any():
-                point_inputs = None
-            else:
-                point_inputs = concat_points(None, points[frame_idx].unsqueeze(0), labels)
+            # =====================================================================
+            # [修改] box/点提示只用于引导 self_prompt(MCP-Encoder)，与"条件帧/记忆"解耦。
+            # 否则若给每个含肿瘤的切片都加提示，会让几乎每帧都变成零记忆初始帧，把双记忆旁路掉。
+            # =====================================================================
+            frame_prompt = None
+            if prompt is not None:
+                try:
+                    if prompt[frame_idx] is not None:
+                        frame_prompt = prompt[frame_idx]
+                except (IndexError, KeyError, TypeError):
+                    frame_prompt = None
+
+            # 条件帧/记忆只看是否第 0 帧，不再受 prompt 影响
+            is_init_cond_frame = (frame_idx == 0)
+            storage_key = "cond_frame_outputs" if is_init_cond_frame else "non_cond_frame_outputs"
 
             current_out, pred_masks = self._run_single_frame_inference(
                 inference_state = inference_state,
                 current_vision_feats = current_vision_feats,
                 current_vision_pos_embeds = current_vision_pos_embeds,
-                feat_sizes=feat_sizes,
+                feat_sizes=global_feat_sizes,
                 output_dict=output_dict,
                 frame_idx=frame_idx,
-                is_init_cond_frame=False if frame_idx > 0 else True,
-                point_inputs=point_inputs if prompt is not None else None,
+                is_init_cond_frame=is_init_cond_frame,
+                point_inputs=frame_prompt,
                 mask_inputs=None,
                 reverse=False,
                 run_mem_encoder=True,
@@ -130,29 +131,57 @@ class SAM2VideoPredictor(SAM2Base):
             output_dict[storage_key][frame_idx] = current_out
             inference_state["modality_mask"][frame_idx] = pred_masks
             self_prompt = current_out['self_prompt']
+            
             outputs_mask.append(pred_masks.squeeze(0))
             outputs_mask_low.append(self_prompt.squeeze(0))
-        time_end = time.time()
-        return torch.stack(outputs_mask, dim=0), torch.stack(outputs_mask_low, dim=0)
+            
+            # ===================================================
+            # [显存优化]：动态释放过期的历史记忆
+            # 最多回溯 7 个 slice (约 28 帧)，我们保留最近 32 帧即可，更老的直接删掉
+            # ===================================================
+            expire_idx = frame_idx - 32
+            if expire_idx >= 0:
+                if expire_idx in output_dict["non_cond_frame_outputs"]:
+                    del output_dict["non_cond_frame_outputs"][expire_idx]
+                if expire_idx in inference_state["modality_mask"]:
+                    del inference_state["modality_mask"][expire_idx]
+                if getattr(inference_state, "self_prompt", None) and expire_idx in inference_state["self_prompt"]:
+                    del inference_state["self_prompt"][expire_idx]
+                    
+            # 定期清理 PyTorch 显存碎片，保持显存水位健康
+            if frame_idx % 40 == 39:
+                torch.cuda.empty_cache()
+            
+        stacked_masks = torch.stack(outputs_mask, dim=0)        # [N,1,H,W] 各(切片,模态)预测 Ŷ_{t,m}
+        stacked_low = torch.stack(outputs_mask_low, dim=0)      # [N,1,H,W] 自提示 guidance
 
+        # =====================================================================
+        # [新增] 论文 Eq.9 模态自适应融合：把每个切片的 M 个模态预测融合成最终 Ŷ_t
+        # 帧按切片优先交错排列(frame = t*M + m)，故 view(L,M,H,W) 即可把每切片的 M 个模态归到一组
+        # =====================================================================
+        N = stacked_masks.shape[0]
+        M = getattr(self, 'num_modality', 4)
+        C = stacked_masks.shape[1]                          # 类别数 (WT/TC/ET = 3)
+        H, W = stacked_masks.shape[-2], stacked_masks.shape[-1]
+        if M > 0 and N % M == 0:
+            L = N // M
+            # [L,M,C,H,W]：每切片 M 个模态、每模态 C 个类别预测 Ŷ_{t,m}
+            mod_logits = stacked_masks.view(L, M, C, H, W)
+            # 把类别折进 batch，对每个类别独立地在 M 个模态上做自适应融合(Eq.9)
+            x = mod_logits.permute(0, 2, 1, 3, 4).reshape(L * C, M, H, W)  # [L*C, M, H, W]
+            fused_x, _ = self.modality_fusion(x)            # [L*C, 1, H, W]
+            fused = fused_x.view(L, C, H, W)                # [L, C, H, W] = Ŷ_t (3 个区域)
+        else:
+            # 兜底：帧数非 M 整数倍时退回取最后一个模态
+            fused = stacked_masks[(M - 1)::M] if M > 0 else stacked_masks
+
+        return stacked_masks, stacked_low, fused
 
     def _run_single_frame_inference(
-        self,
-        inference_state,
-        current_vision_feats,
-        current_vision_pos_embeds,
-        feat_sizes,
-        output_dict,
-        frame_idx,
-        is_init_cond_frame,
-        point_inputs,
-        mask_inputs,
-        reverse,
-        run_mem_encoder,
-        prev_sam_mask_logits=None,
+        self, inference_state, current_vision_feats, current_vision_pos_embeds,
+        feat_sizes, output_dict, frame_idx, is_init_cond_frame,
+        point_inputs, mask_inputs, reverse, run_mem_encoder, prev_sam_mask_logits=None,
     ):
-        """Run tracking on a single frame based on current inputs and previous memory."""
-        # print(is_init_cond_frame)
         current_out = self.track_step(
             inference_state=inference_state,
             frame_idx=frame_idx,
@@ -169,19 +198,11 @@ class SAM2VideoPredictor(SAM2Base):
             prev_sam_mask_logits=prev_sam_mask_logits,
         )
 
-        storage_device = inference_state["storage_device"]
         maskmem_features = current_out["maskmem_features"]
-
-        if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16)
-            maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         pred_masks_gpu = current_out["pred_masks_high_res"]
-
-        pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
-        # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
+        pred_masks = pred_masks_gpu 
+        
         maskmem_pos_enc = self._get_maskmem_pos_enc(inference_state, current_out)
-        # object pointer is a small tensor, so we always keep it on GPU memory for fast access
-        # make a compact version of this frame's output to reduce the state size
         self_prompt = current_out.get("self_prompt", None)
         compact_current_out = {
             "maskmem_features": maskmem_features,
@@ -196,54 +217,31 @@ class SAM2VideoPredictor(SAM2Base):
             
         return compact_current_out, pred_masks_gpu
 
-    def _run_memory_encoder(
-        self, inference_state, frame_idx, batch_size, high_res_masks, is_mask_from_pts
-    ):
-        """
-        Run the memory encoder on `high_res_masks`. This is usually after applying
-        non-overlapping constraints to object scores. Since their scores changed, their
-        memory also need to be computed again with the memory encoder.
-        """
-        # Retrieve correct image features
+    def _run_memory_encoder(self, inference_state, frame_idx, batch_size, high_res_masks, is_mask_from_pts):
         _, _, current_vision_feats, _, feat_sizes = self._get_image_feature(
             inference_state, frame_idx, batch_size
         )
-
-        
         maskmem_features, maskmem_pos_enc = self._encode_new_memory(
             current_vision_feats=current_vision_feats,
             feat_sizes=feat_sizes,
             pred_masks_high_res=high_res_masks,
             is_mask_from_pts=is_mask_from_pts,
         )
-
-        # optionally offload the output to CPU memory to save GPU space
-        storage_device = inference_state["storage_device"]
-        maskmem_features = maskmem_features.to(torch.bfloat16)
-        maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
-        # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(
             inference_state, {"maskmem_pos_enc": maskmem_pos_enc}
         )
         return maskmem_features, maskmem_pos_enc
 
     def _get_maskmem_pos_enc(self, inference_state, current_out):
-        """
-        `maskmem_pos_enc` is the same across frames and objects, so we cache it as
-        a constant in the inference session to reduce session storage size.
-        """
         model_constants = inference_state["constants"]
-        # "out_maskmem_pos_enc" should be either a list of tensors or None
         out_maskmem_pos_enc = current_out["maskmem_pos_enc"]
         if out_maskmem_pos_enc is not None:
             if "maskmem_pos_enc" not in model_constants:
                 assert isinstance(out_maskmem_pos_enc, list)
-                # only take the slice for one object, since it's same across objects
                 maskmem_pos_enc = [x[0:1].clone() for x in out_maskmem_pos_enc]
                 model_constants["maskmem_pos_enc"] = maskmem_pos_enc
             else:
                 maskmem_pos_enc = model_constants["maskmem_pos_enc"]
-            # expand the cached maskmem_pos_enc to the actual batch size
             batch_size = out_maskmem_pos_enc[0].size(0)
             expanded_maskmem_pos_enc = [
                 x.expand(batch_size, -1, -1, -1) for x in maskmem_pos_enc

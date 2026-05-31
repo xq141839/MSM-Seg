@@ -9,28 +9,33 @@ class PyramidPromptUNet(nn.Module):
     利用backbone的多尺度特征做UNet上采样
     """
     
-    def __init__(self, feature_channels=256, device=None):
+    def __init__(self, feature_channels=256, hi_res_chans=(32, 64),
+                 prompt_widths=(16, 16, 32), device=None):
         super().__init__()
-        
+
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cuda"
         self.device = device
-        
-        # 提示编码器 - 将提示信息编码到不同尺度
-        self.prompt_processors = nn.ModuleDict({
-            'scale_128': self._make_prompt_processor(5, 32),   # 128x128 (5通道: box+4点类型)
-            'scale_64': self._make_prompt_processor(5, 64),   # 64x64  
-            'scale_32': self._make_prompt_processor(5, 256),   # 32x32
+
+        # SAM2 高分辨率特征通道：f_256(stride4)=c256, f_128(stride8)=c128, f_64(stride16)=feature_channels
+        c256, c128 = hi_res_chans          # 默认 (32, 64)，对应 SAM2 的 conv_s0/conv_s1
+        c64 = feature_channels             # pix_feat_with_mem 通道数（默认 256）
+        w256, w128, w64 = prompt_widths    # 各尺度提示特征宽度
+
+        # 多尺度提示处理器：把 5 通道提示图 (box 1 + click 4) 编码成小特征
+        self.prompt_proc = nn.ModuleDict({
+            's256': self._make_prompt_processor(5, w256),
+            's128': self._make_prompt_processor(5, w128),
+            's64':  self._make_prompt_processor(5, w64),
         })
-        
-        # 特征融合模块 - 融合backbone特征和提示特征
-        self.feature_fusion = nn.ModuleDict({
-            'fuse_128': nn.Conv2d(feature_channels*2, feature_channels, 3, padding=1),
-            'fuse_64': nn.Conv2d(feature_channels//2, feature_channels//4, 3, padding=1),
-            'fuse_32': nn.Conv2d(feature_channels//4, feature_channels//8, 3, padding=1),
+        # 融合层：拼接 backbone 特征 + 提示特征 -> 卷回原通道数（保证解码器输入维度不变）
+        self.prompt_fuse = nn.ModuleDict({
+            's256': nn.Conv2d(c256 + w256, c256, 3, padding=1),
+            's128': nn.Conv2d(c128 + w128, c128, 3, padding=1),
+            's64':  nn.Conv2d(c64 + w64,   c64,  3, padding=1),
         })
-        
-        # UNet解码器 - 从32x32开始上采样到256x256
+
+        # UNet解码器 - 从64x64开始上采样到256x256
         self.decoder = PyramidDecoder(feature_channels)
         
     def _make_prompt_processor(self, in_channels, out_channels):
@@ -44,114 +49,93 @@ class PyramidPromptUNet(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-    def forward(self, 
-                high_res_features: List[torch.Tensor],  # {'f_128':..., 'f_64':..., 'f_32':...}
-                pix_feat_with_mem: torch.Tensor = None,  # 当前帧索引
-                past_mask: Optional[torch.Tensor] = None,     # [B, 1, 256, 256]
+    def forward(self,
+                high_res_features: List[torch.Tensor],  # [f_256(stride4), f_128(stride8)]
+                pix_feat_with_mem: torch.Tensor = None,  # f_64(stride16)，MSMA 输出的记忆增强特征
+                past_mask: Optional[torch.Tensor] = None,
                 point_coords: Optional[torch.Tensor] = None,  # [B, n, 2]
                 point_labels: Optional[torch.Tensor] = None,  # [B, n]
-                scribbles: Optional[torch.Tensor] = None,     # [B, 2, 256, 256]
-                box: Optional[torch.Tensor] = None,           # [B, 1, 4]
-                use_prompts: bool = True,                     # 是否使用提示信息
-                input_resolution: int = 1024,                 # 输入坐标的原始分辨率
+                scribbles: Optional[torch.Tensor] = None,
+                box: Optional[torch.Tensor] = None,           # [B, n, 4] = x1,y1,x2,y2
+                use_prompts: bool = True,
+                input_resolution: int = 256,                  # 提示坐标所在坐标系(默认 256，与 guidance 同尺度)
                 ):
-        # for i in range(len(pyramid_features)):
-        #     print(pyramid_features[i].shape)
-        # print(cached_features.keys())
-        f_128 = high_res_features[1] # [B, 64, 32, 32]
-        f_64 = pix_feat_with_mem # [B, 256, 16, 16]
-        f_256 = high_res_features[0] # [B, 32, 64, 64]
-        batch_size = f_128.shape[0]
-        
-#         # 如果不使用提示信息，直接使用backbone特征进行UNet解码
-#         if not use_prompts:
-        # output = self.decoder(f_64, f_128, f_256)  # [B, 1, 256, 256]
-        # return output
-        
-        # 1. 编码提示信息到不同尺度
+        f_256 = high_res_features[0]   # [B, c256, 256, 256]
+        f_128 = high_res_features[1]   # [B, c128, 128, 128]
+        f_64 = pix_feat_with_mem       # [B, c64, 64, 64]
+        batch_size = f_64.shape[0]
+
+        has_prompt = use_prompts and (
+            box is not None or point_coords is not None or scribbles is not None
+        )
+
+        # --- 自动模式：无提示，直接用 backbone 特征解码 ---
+        if not has_prompt:
+            return self.decoder(f_64, f_128, f_256)
+
+        # --- 提示模式：把 box/点编码成多尺度提示图，与各尺度特征融合后再解码 ---
         prompts = {
             'point_coords': point_coords,
             'point_labels': point_labels,
             'scribbles': scribbles,
             'box': box,
         }
-        
-        # 编码到各个尺度
-        prompt_128 = self._encode_prompts(prompts, (64, 64), batch_size, input_resolution)  # [B, 5, 128, 128]
-        prompt_64 = self._encode_prompts(prompts, (32, 32), batch_size, input_resolution)     # [B, 5, 64, 64]
-        prompt_32 = self._encode_prompts(prompts, (16, 16), batch_size, input_resolution)     # [B, 5, 32, 32]
-        
-        # 加入past_mask信息到最高分辨率 (如果提供的话)
-        if past_mask is not None:
-            past_mask_128 = F.interpolate(past_mask, size=(128, 128), mode='bilinear', align_corners=False)
-            prompt_128 = torch.cat([prompt_128, past_mask_128], dim=1)  # [B, 6, 128, 128]
-            prompt_128 = prompt_128[:, :5, :, :]  # 保持5通道，融合past_mask到第一个通道
-        
-        # 2. 处理提示特征
-        prompt_feat_128 = self.prompt_processors['scale_128'](prompt_128)  # [B, 64, 128, 128]
-        prompt_feat_64 = self.prompt_processors['scale_64'](prompt_64)     # [B, 128, 64, 64]
-        prompt_feat_32 = self.prompt_processors['scale_32'](prompt_32)     # [B, 256, 32, 32]
-        
+        p_256 = self._encode_prompts(prompts, (256, 256), batch_size, input_resolution, ref=f_256)
+        p_128 = self._encode_prompts(prompts, (128, 128), batch_size, input_resolution, ref=f_128)
+        p_64 = self._encode_prompts(prompts, (64, 64), batch_size, input_resolution, ref=f_64)
 
-        # 3. 融合backbone特征和提示特征
-        fused_128 = self.feature_fusion['fuse_128'](
-            torch.cat([f_64, prompt_feat_32], dim=1)
-        )  # [B, 256, 128, 128]
-        
-        fused_64 = self.feature_fusion['fuse_64'](
-            torch.cat([f_128, prompt_feat_64], dim=1)
-        )  # [B, 256, 64, 64]
-        
-        fused_32 = self.feature_fusion['fuse_32'](
-            torch.cat([f_256, prompt_feat_128], dim=1)
-        )  # [B, 256, 32, 32]
-        
-        # 4. UNet解码器 - 带跳跃连接的上采样
-        output = self.decoder(fused_128, fused_64, fused_32)  # [B, 1, 256, 256]
-        
-        return output
+        fp_256 = self.prompt_proc['s256'](p_256)
+        fp_128 = self.prompt_proc['s128'](p_128)
+        fp_64 = self.prompt_proc['s64'](p_64)
+
+        fused_256 = self.prompt_fuse['s256'](torch.cat([f_256, fp_256], dim=1))
+        fused_128 = self.prompt_fuse['s128'](torch.cat([f_128, fp_128], dim=1))
+        fused_64 = self.prompt_fuse['s64'](torch.cat([f_64, fp_64], dim=1))
+
+        return self.decoder(fused_64, fused_128, fused_256)
     
-    def _encode_prompts(self, prompts: Dict, shape: Tuple[int, int], batch_size: int, input_resolution: int = 1024) -> torch.Tensor:
-        """编码提示信息到指定尺度"""
-        device = self.device
-        
-        # 编码边界框
+    def _encode_prompts(self, prompts: Dict, shape: Tuple[int, int], batch_size: int,
+                        input_resolution: int = 256, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """把提示编码成 [B,5,H,W] 的提示图（box 1 通道 + 点 4 通道），坐标按尺度缩放。"""
+        device = ref.device if ref is not None else torch.device(self.device)
+        H, W = shape
+        sx = W / float(input_resolution)
+        sy = H / float(input_resolution)
+
+        # 边界框：从 input_resolution 坐标系缩放到当前尺度，再填成实心框
+        # [修复] 原实现对所有尺度用同一坐标的 box（未缩放），这里按尺度缩放后再 shade
         if prompts.get("box") is not None:
-            box_embed = bbox_shaded(prompts['box'], shape=shape, device=device)
+            box = prompts['box'].float()
+            box_scaled = box.clone()
+            box_scaled[..., 0] = box[..., 0] * sx
+            box_scaled[..., 2] = box[..., 2] * sx
+            box_scaled[..., 1] = box[..., 1] * sy
+            box_scaled[..., 3] = box[..., 3] * sy
+            box_embed = bbox_shaded(box_scaled, shape=shape, device=device)  # [B,1,H,W]
         else:
             box_embed = torch.zeros((batch_size, 1) + shape, device=device)
-        
-        # 编码点击
+
+        # 点击（可选）：同样按尺度缩放坐标
         if prompts.get("point_coords") is not None:
-            # 缩放坐标从input_resolution到目标尺度
             coords = prompts['point_coords'].clone().float()
-            # 首先从input_resolution缩放到256×256
-            coords[..., 0] = coords[..., 0] * (256.0 / input_resolution)  # x坐标
-            coords[..., 1] = coords[..., 1] * (256.0 / input_resolution)  # y坐标
-            # 然后从256×256缩放到目标尺度
-            coords[..., 0] = coords[..., 0] * (shape[1] / 256.0)  # x坐标: 256 -> target_width
-            coords[..., 1] = coords[..., 1] * (shape[0] / 256.0)  # y坐标: 256 -> target_height
-            coords = coords.int()
-            
-            # 边界检查和裁剪
-            coords[..., 0] = torch.clamp(coords[..., 0], 0, shape[1] - 1)
-            coords[..., 1] = torch.clamp(coords[..., 1], 0, shape[0] - 1)
-            
-            click_embed = click_onehot(coords, prompts['point_labels'], shape=shape)  # 返回4通道
+            coords[..., 0] = coords[..., 0] * sx
+            coords[..., 1] = coords[..., 1] * sy
+            coords = coords.round().int()
+            coords[..., 0] = torch.clamp(coords[..., 0], 0, W - 1)
+            coords[..., 1] = torch.clamp(coords[..., 1], 0, H - 1)
+            click_embed = click_onehot(coords, prompts['point_labels'], shape=shape)  # [B,4,H,W]
         else:
-            click_embed = torch.zeros((batch_size, 4) + shape, device=device)  # 4通道零向量
-        
-        # 处理涂鸦 - 下采样到目标尺度
+            click_embed = torch.zeros((batch_size, 4) + shape, device=device)
+
+        # 涂鸦（可选）
         if prompts.get("scribbles") is not None:
             scribbles_resized = F.interpolate(
-                prompts['scribbles'], size=shape, mode='bilinear', align_corners=False
+                prompts['scribbles'].float(), size=shape, mode='bilinear', align_corners=False
             )
             click_embed = torch.clamp(click_embed + scribbles_resized, min=0.0, max=1.0)
-        
-        # 拼接：box(1) + clicks(4) = 5 channels
-        prompt_embeds = torch.cat([box_embed, click_embed], dim=1)
-        
-        return prompt_embeds
+
+        prompt_embeds = torch.cat([box_embed, click_embed], dim=1)  # [B,5,H,W]
+        return prompt_embeds.to(device)
 
 class Up(nn.Module):
     """Upscaling"""
@@ -324,7 +308,7 @@ def bbox_shaded(boxes, shape: Tuple[int,int] = (128,128), device='cpu'):
 
 # 测试代码
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     print(f"使用设备: {device}")
     
     model = PyramidPromptUNet(feature_channels=256, device=device).to(device)
@@ -437,3 +421,34 @@ if __name__ == "__main__":
     print("✓ 模型支持无提示和有提示两种模式")
     print("✓ 可以进行正常的训练和推理")
     print("✓ 特征金字塔输入正常工作")
+
+class ModalityAdaptiveFusion(nn.Module):
+    """论文 Eq.9 / Eq.2 的模态自适应融合：Ŷ_t = Σ_m w_m · Ŷ_{t,m}
+
+    把同一切片的 M 个模态预测(logits)逐体素自适应加权融合成最终切片预测 Ŷ_t。
+    权重 w_m 由一个小卷积网络从各模态预测产生，并沿模态维做 softmax，
+    使每个体素上 M 个模态的权重之和为 1（即“逐体素动态选择最有信息的模态”）。
+
+    这取代了原代码“固定权重 [0.2,0.4,0.6,1.0] + 直接取第 4 模态当融合”的简化做法。
+    """
+
+    def __init__(self, num_modality=4, hidden=16):
+        super().__init__()
+        self.num_modality = num_modality
+        g = 4 if hidden % 4 == 0 else 1
+        self.weight_net = nn.Sequential(
+            nn.Conv2d(num_modality, hidden, 3, padding=1),
+            nn.GroupNorm(g, hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, num_modality, 1),
+        )
+
+    def forward(self, mod_logits):
+        """mod_logits: [L, M, H, W]，同一批 L 个切片、各 M 个模态的预测 logits。
+        返回 (fused, weights)：fused=[L,1,H,W] 融合后切片预测 logits；weights=[L,M,H,W]。"""
+        if self.num_modality == 1:
+            return mod_logits, torch.ones_like(mod_logits)
+        w = self.weight_net(mod_logits)            # [L, M, H, W]
+        w = torch.softmax(w, dim=1)                # 沿模态维归一化
+        fused = (w * mod_logits).sum(dim=1, keepdim=True)  # [L, 1, H, W]
+        return fused, w
