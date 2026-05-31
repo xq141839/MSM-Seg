@@ -53,15 +53,13 @@ The json structure is as follows.
      }
 
 ## 🎪Quickstart
-* Train the Co-Seg++ with the default settings:
+* Train the MSM-Seg with the default settings:
 ```python
 
-python train_3d.py -net sam2 -exp_name brain_mets -vis 0 -sam_ckpt checkpoints/$SAM2 CHECKPOINT$ -sam_config $SAM2 CONFIG$ -b 4 -dataset brats -data_path $YOUR DATASET PATH$
+python run.py -gpus 0 -skip_test
 
 
 ```
-
-
 
 ## Acknowledgements
 
@@ -69,4 +67,16 @@ python train_3d.py -net sam2 -exp_name brain_mets -vis 0 -sam_ckpt checkpoints/$
 * [MedSAM2](https://github.com/bowang-lab/MedSAM2)
 * [nnUNet](https://github.com/MIC-DKFZ/nnUNet)
 
+## Citation
 
+```
+@misc{luo2025msmsegmodalityandslicememoryframework,
+      title={MSM-Seg: A Modality-and-Slice Memory Framework with Category-Agnostic Prompting for Multi-Modal Brain Tumor Segmentation}, 
+      author={Yuxiang Luo and Qing Xu and Hai Huang and Yuqi Ouyang and Zhen Chen and Wenting Duan},
+      year={2025},
+      eprint={2510.10679},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2510.10679}, 
+}
+```
