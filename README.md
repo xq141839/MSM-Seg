@@ -81,12 +81,6 @@ The json structure is as follows.
 
 The full pipeline is: **download → preprocess → train → test**. All commands are run from the project root.
 
-### 1. Download the dataset (optional)
-We provide the preprocessed-ready BraTS release on Hugging Face. Edit `local_download_dir` (and your Hugging Face access token) at the top of `download.py`, then:
-```bash
-python download.py
-```
-
 ### 2. Preprocessing
 Preprocessing resizes every volume to `256×256` in-plane, applies brain-region **z-score normalization** to each of the 4 modalities, and caches each case as a compressed `.npz` (`imgs` of shape `[4, 256, 256, Z]` and `mask` of shape `[256, 256, Z]`).
 
