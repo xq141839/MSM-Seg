@@ -160,11 +160,6 @@ python test_3d.py -prompt bbox -exp_name brats_MedSAM2_ALL \
 ```
 Evaluation reports **Dice** and **HD95** for **WT / TC / ET** (and their average), following the BraTS protocol. Predicted masks are saved as `.nii.gz` together with per-slice PNG visualizations under the experiment directory.
 
-### (Optional) Data sanity check
-To detect unreadable / problematic cases before training:
-```bash
-python delete.py -data_path /path/to/Dataset102_met
-```
 
 ## Acknowledgements
 * [SAM2](https://github.com/facebookresearch/sam2)
