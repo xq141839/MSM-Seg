@@ -14,6 +14,7 @@
 ![introduction](figs/method.png)
 ## 📰News
 - **[2025.10.12]** We have released the code for MSM-Seg!
+- **[2025.06.01]** We have updated the code.
 
 ## 🛠Setup
 
